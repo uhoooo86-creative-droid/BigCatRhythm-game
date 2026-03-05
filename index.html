@@ -423,6 +423,39 @@ html, body { width:100%; height:100%; overflow:hidden; background:var(--bg); fon
 #miss-flash { position:fixed; inset:0; pointer-events:none; z-index:700; background:rgba(200,80,80,0); transition:background 0.05s; }
 #miss-flash.flash { background:rgba(200,80,80,0.12); }
 
+/* 미스 왜곡 오버레이 */
+#distort-overlay {
+  position:fixed; inset:0; z-index:696; pointer-events:none; opacity:0;
+  background:repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 3px,
+    rgba(100,50,50,0.04) 3px,
+    rgba(100,50,50,0.04) 4px
+  );
+  transition:opacity 0.1s;
+}
+#distort-overlay.active {
+  opacity:1;
+  animation:distort-wave 0.5s ease-out forwards;
+}
+@keyframes distort-wave {
+  0%{opacity:1;filter:hue-rotate(0deg) saturate(0.3) brightness(0.85)}
+  30%{filter:hue-rotate(-25deg) saturate(0.2) brightness(0.8)}
+  60%{filter:hue-rotate(-10deg) saturate(0.5) brightness(0.9)}
+  100%{opacity:0;filter:hue-rotate(0deg) saturate(1) brightness(1)}
+}
+
+/* 미스 시 게임화면 전체 채도 낮추기 */
+#game-screen.miss-effect {
+  animation:game-desaturate 1.5s ease-out;
+}
+@keyframes game-desaturate {
+  0%{filter:saturate(0.2) brightness(0.85) hue-rotate(-15deg)}
+  40%{filter:saturate(0.4) brightness(0.9)}
+  100%{filter:saturate(1) brightness(1)}
+}
+
 /* ── 결과 화면 ── */
 #result-screen {
   display:none; position:fixed; inset:0; z-index:800;
@@ -513,6 +546,7 @@ html, body { width:100%; height:100%; overflow:hidden; background:var(--bg); fon
 <canvas id="bg-canvas"></canvas>
 <canvas id="fw-canvas"></canvas>
 <div id="miss-flash"></div>
+<div id="distort-overlay"></div>
 
 <!-- ── 업로드 ── -->
 <div id="upload-screen">
@@ -668,6 +702,7 @@ const CHARS = {
 
 // ── 상태 ──
 let audioCtx, audioBuffer, sourceNode, analyser, freqData;
+let masterGain, distortionNode, pitchFilterNode; // 음악 효과 노드들
 let audioFile=null, difficulty='normal', laneCount=6, speedMult=1.0;
 let gameRunning=false, startTime=0;
 let notes=[], score=0, combo=0, maxCombo=0;
@@ -675,6 +710,7 @@ let cntPerfect=0, cntGreat=0, cntMiss=0, totalNotes=0, noteId=0;
 let raf, duration=0;
 let laneEls=[], keyBtnEls=[], judgeEls=[];
 let feverMode=false, lastBeatTime=0;
+let missCount=0, missRecoveryTimer=null; // 연속 미스 추적
 
 // ── 파티클 배경 ──
 (()=>{
@@ -765,16 +801,90 @@ function getAC(){
   return audioCtx;
 }
 
+// ── 디스토션 커브 생성 ──
+function makeDistortionCurve(amount){
+  const n=512, curve=new Float32Array(n);
+  for(let i=0;i<n;i++){
+    const x=(i*2)/n-1;
+    if(amount===0){curve[i]=x;}
+    else{curve[i]=(Math.PI+amount)*x/(Math.PI+amount*Math.abs(x));}
+  }
+  return curve;
+}
+
+// ── 음악에 미스 효과 적용 (볼륨 다운 + 피치 왜곡 + 디스토션) ──
+function applyMissEffect(){
+  if(!masterGain||!pitchFilterNode||!distortionNode)return;
+  const ctx=audioCtx;
+  const now=ctx.currentTime;
+
+  missCount=Math.min(missCount+1,5);
+  const severity=missCount/5; // 0~1, 연속 미스일수록 심해짐
+
+  // 1) 볼륨 뚝 떨어졌다가 서서히 회복
+  masterGain.gain.cancelScheduledValues(now);
+  masterGain.gain.setValueAtTime(masterGain.gain.value,now);
+  masterGain.gain.linearRampToValueAtTime(0.3+0.2*severity*-1, now+0.05); // 순간 뚝
+  masterGain.gain.linearRampToValueAtTime(0.5+0.5*(1-severity*0.3), now+0.6); // 서서히 회복
+  masterGain.gain.linearRampToValueAtTime(1.0, now+1.8+severity);
+
+  // 2) 로우패스 필터로 피치 뭉개기 (탁해짐)
+  pitchFilterNode.frequency.cancelScheduledValues(now);
+  pitchFilterNode.frequency.setValueAtTime(22000,now);
+  pitchFilterNode.frequency.linearRampToValueAtTime(300+200*(1-severity), now+0.08); // 급격히 막힘
+  pitchFilterNode.frequency.exponentialRampToValueAtTime(8000, now+0.5);
+  pitchFilterNode.frequency.exponentialRampToValueAtTime(22000, now+1.5+severity*0.5);
+  pitchFilterNode.Q.setValueAtTime(8,now);
+  pitchFilterNode.Q.linearRampToValueAtTime(1,now+1.5);
+
+  // 3) 디스토션 (음 깨짐)
+  distortionNode.curve=makeDistortionCurve(80+120*severity);
+  setTimeout(()=>{
+    distortionNode.curve=makeDistortionCurve(20);
+    setTimeout(()=>distortionNode.curve=makeDistortionCurve(0),600);
+  },200);
+
+  // 4) 회복 타이머 리셋
+  if(missRecoveryTimer)clearTimeout(missRecoveryTimer);
+  missRecoveryTimer=setTimeout(()=>{
+    missCount=Math.max(0,missCount-1);
+  },2000);
+}
+
+// ── 콤보 회복 시 음악도 밝아짐 ──
+function applyComboRecovery(){
+  if(!masterGain||!pitchFilterNode)return;
+  const ctx=audioCtx,now=ctx.currentTime;
+  masterGain.gain.cancelScheduledValues(now);
+  masterGain.gain.setValueAtTime(masterGain.gain.value,now);
+  masterGain.gain.linearRampToValueAtTime(1.0,now+0.3);
+  pitchFilterNode.frequency.cancelScheduledValues(now);
+  pitchFilterNode.frequency.setValueAtTime(pitchFilterNode.frequency.value,now);
+  pitchFilterNode.frequency.linearRampToValueAtTime(22000,now+0.3);
+  distortionNode.curve=makeDistortionCurve(0);
+  missCount=Math.max(0,missCount-1);
+}
+
 function playMiss(){
   const ctx=getAC();
-  const o=ctx.createOscillator(),g=ctx.createGain();
-  o.type='sawtooth';
-  o.frequency.setValueAtTime(200,ctx.currentTime);
-  o.frequency.exponentialRampToValueAtTime(60,ctx.currentTime+0.25);
-  g.gain.setValueAtTime(0.2,ctx.currentTime);
-  g.gain.exponentialRampToValueAtTime(0.001,ctx.currentTime+0.3);
-  o.connect(g);g.connect(ctx.destination);
-  o.start();o.stop(ctx.currentTime+0.35);
+  // 불협화음 "꽥" 사운드
+  [180,181.5,252].forEach((f,i)=>{
+    const o=ctx.createOscillator(),g=ctx.createGain();
+    o.type=i===2?'square':'sawtooth';
+    o.frequency.setValueAtTime(f,ctx.currentTime);
+    o.frequency.exponentialRampToValueAtTime(55+i*5,ctx.currentTime+0.28);
+    g.gain.setValueAtTime(0.15,ctx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001,ctx.currentTime+0.32);
+    o.connect(g);g.connect(ctx.destination);
+    o.start();o.stop(ctx.currentTime+0.36);
+  });
+  // 노이즈 크랙
+  const bs=ctx.sampleRate*0.15,buf=ctx.createBuffer(1,bs,ctx.sampleRate);
+  const d=buf.getChannelData(0);
+  for(let i=0;i<bs;i++)d[i]=(Math.random()*2-1)*Math.exp(-i/(bs*0.06));
+  const ns=ctx.createBufferSource(),ng=ctx.createGain();
+  ns.buffer=buf;ng.gain.value=0.35;
+  ns.connect(ng);ng.connect(ctx.destination);ns.start();
 }
 
 function playGood(){
@@ -876,12 +986,19 @@ function breakFever(){
 // ── FX ──
 function shakeScreen(){
   const gs=document.getElementById('game-screen');
-  gs.classList.remove('shake-anim');void gs.offsetWidth;gs.classList.add('shake-anim');
+  gs.classList.remove('shake-anim','miss-effect');
+  void gs.offsetWidth;
+  gs.classList.add('shake-anim','miss-effect');
   setTimeout(()=>gs.classList.remove('shake-anim'),350);
+  setTimeout(()=>gs.classList.remove('miss-effect'),1600);
 }
 function flashRed(){
   const f=document.getElementById('miss-flash');
+  const d=document.getElementById('distort-overlay');
   f.classList.add('flash');setTimeout(()=>f.classList.remove('flash'),100);
+  // 왜곡 오버레이
+  d.classList.remove('active');void d.offsetWidth;d.classList.add('active');
+  setTimeout(()=>d.classList.remove('active'),600);
 }
 
 // ── 레인 빌드 ──
@@ -1032,11 +1149,28 @@ function startGame(){
   analyser=audioCtx.createAnalyser();analyser.fftSize=512;
   freqData=new Uint8Array(analyser.frequencyBinCount);
 
+  // ── 오디오 이펙트 체인: source → analyser → distortion → pitchFilter → masterGain → out ──
+  masterGain = audioCtx.createGain();
+  masterGain.gain.value = 1.0;
+
+  distortionNode = audioCtx.createWaveShaper();
+  distortionNode.curve = makeDistortionCurve(0);
+
+  pitchFilterNode = audioCtx.createBiquadFilter();
+  pitchFilterNode.type = 'lowpass';
+  pitchFilterNode.frequency.value = 22000;
+  pitchFilterNode.Q.value = 1;
+
   if(sourceNode){try{sourceNode.stop();}catch(e){}}
   sourceNode=audioCtx.createBufferSource();
   sourceNode.buffer=audioBuffer;
-  sourceNode.connect(analyser);analyser.connect(audioCtx.destination);
+  sourceNode.connect(analyser);
+  analyser.connect(distortionNode);
+  distortionNode.connect(pitchFilterNode);
+  pitchFilterNode.connect(masterGain);
+  masterGain.connect(audioCtx.destination);
   sourceNode.start(0);startTime=audioCtx.currentTime;gameRunning=true;
+  missCount=0;
   sourceNode.onended=()=>{if(gameRunning)endGame();};
   scheduleNotes();gameLoop();
 }
@@ -1137,6 +1271,9 @@ function pressLane(lane){
     if(bestDist<=pxPerf)regPerfect(lane);
     else if(bestDist<=pxGreat)regGreat(lane);
     else regGood(lane);
+  } else if(!best || bestDist > pxGood*2) {
+    // 빈 레인 클릭 = 틀린 입력! (가까운 노트가 없을 때)
+    registerEmptyHit(lane);
   }
 }
 function releaseLane(lane){keyBtnEls[lane]&&keyBtnEls[lane].classList.remove('pressed');}
@@ -1145,20 +1282,46 @@ function releaseLane(lane){keyBtnEls[lane]&&keyBtnEls[lane].classList.remove('pr
 function regPerfect(lane){
   combo++;maxCombo=Math.max(maxCombo,combo);score+=300+combo*3;cntPerfect++;
   judge(lane,'✦ PERFECT','j-perfect');playPerfect();updateHUD('pop');checkMilestone();
+  if(combo>=3)applyComboRecovery(); // 3연속 좋은 판정 시 음악 회복
 }
 function regGreat(lane){
   combo++;maxCombo=Math.max(maxCombo,combo);score+=180+combo*2;cntGreat++;
   judge(lane,'GREAT','j-great');playGreat();updateHUD('pop');checkMilestone();
+  if(combo>=3)applyComboRecovery();
 }
 function regGood(lane){
   combo++;maxCombo=Math.max(maxCombo,combo);score+=80+combo;cntGreat++;
   judge(lane,'GOOD','j-good');playGood();updateHUD();checkMilestone();
 }
+// 빈 레인 클릭 (틀린 입력) - 콤보는 안 깨지지만 음악 효과는 살짝 들어감
+function registerEmptyHit(lane){
+  judge(lane,'BAD','j-miss');
+  playMiss();
+  // 음악 살짝만 흔들기 (auto miss보다 약하게)
+  if(masterGain&&pitchFilterNode){
+    const ctx=audioCtx,now=ctx.currentTime;
+    masterGain.gain.cancelScheduledValues(now);
+    masterGain.gain.setValueAtTime(masterGain.gain.value,now);
+    masterGain.gain.linearRampToValueAtTime(0.6,now+0.04);
+    masterGain.gain.linearRampToValueAtTime(1.0,now+0.7);
+    pitchFilterNode.frequency.cancelScheduledValues(now);
+    pitchFilterNode.frequency.setValueAtTime(22000,now);
+    pitchFilterNode.frequency.linearRampToValueAtTime(1200,now+0.05);
+    pitchFilterNode.frequency.exponentialRampToValueAtTime(22000,now+0.6);
+    distortionNode.curve=makeDistortionCurve(40);
+    setTimeout(()=>distortionNode.curve=makeDistortionCurve(0),300);
+  }
+  flashRed();
+  updateHUD();
+}
+
 function registerMiss(lane,auto=false){
   combo=0;cntMiss++;
   judge(lane,'MISS','j-miss');
-  if(!auto){playMiss();shakeScreen();flashRed();breakFever();}
-  else{updateMascot('worry');}
+  playMiss();
+  applyMissEffect();
+  shakeScreen();flashRed();breakFever();
+  updateMascot('worry');
   updateHUD();
 }
 
