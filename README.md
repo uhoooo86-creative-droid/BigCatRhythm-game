@@ -1,2 +1,2 @@
-# BigCat-Rhythm-Game
+# 빵냥 Rhythm-Game
 Music Q
