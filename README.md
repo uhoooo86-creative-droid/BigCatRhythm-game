@@ -1,2 +1,2 @@
-# ez to dj
-Music Q
+# BC 21 DJ
+Rhythm Game
